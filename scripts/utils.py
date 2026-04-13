@@ -136,13 +136,23 @@ def list_slug_daily_files() -> list[Path]:
 
 
 def count_inbound_links(target: str, exclude_file: Path | None = None) -> int:
+    """Count articles linking to target. Handles Obsidian aliased links.
+
+    Fix for Cole's GH issue #7 tail: [[target|alias]] form was being missed.
+    We now extract every wikilink, strip alias + heading fragments, and compare
+    to the target.
+    """
     count = 0
+    target_norm = target.split("|")[0].split("#")[0].strip().replace("\\", "/")
     for article in list_wiki_articles():
         if article == exclude_file:
             continue
         content = article.read_text(encoding="utf-8")
-        if f"[[{target}]]" in content:
-            count += 1
+        for link in extract_wikilinks(content):
+            link_norm = link.split("|")[0].split("#")[0].strip().replace("\\", "/")
+            if link_norm == target_norm:
+                count += 1
+                break
     return count
 
 

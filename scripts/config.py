@@ -48,7 +48,18 @@ LOG_FILE = KNOWLEDGE_DIR / "log.md"
 TIMEZONE = "America/Phoenix"
 
 # ── Tunables ──────────────────────────────────────────────────────────
-COMPILE_AFTER_HOUR = 18
+# Compile trigger policy (replaces Cole's 6PM wall-clock gate, see GH issues #4/#6).
+# Compile fires when BOTH are true:
+#   1. There's something to compile (uncompiled bare-date daily OR today's hash changed)
+#   2. It's been >= COMPILE_MIN_INTERVAL_HOURS since the last compile run
+# Time-of-day plays no role. Works regardless of when Christopher wraps up.
+COMPILE_MIN_INTERVAL_HOURS = 1.0
+
+# Cost cap — hard stop if today's compile spend exceeds this. Protects against
+# runaway cost (Cole's GH issue #3: ellismw burned $115 in 20 min).
+# Loud-fails to inbox/_inbox-master.md with ⚠ prefix when hit.
+DAILY_COMPILE_COST_CAP_USD = 3.00
+
 MAX_CONTEXT_CHARS = 15_000
 MIN_TURNS_TO_FLUSH = 1
 FLUSH_DEDUP_SECONDS = 60

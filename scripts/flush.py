@@ -29,7 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import (
-    COMPILE_AFTER_HOUR,
+    COMPILE_MIN_INTERVAL_HOURS,
+    DAILY_COMPILE_COST_CAP_USD,
     DAILY_DIR,
     FLUSH_DEDUP_SECONDS,
     FLUSH_LOG,
@@ -191,33 +192,89 @@ Skip anything that is:
 
 
 def maybe_trigger_compilation() -> None:
-    """If past compile hour and today's daily has changed since last compile, spawn compile.py."""
+    """Trigger compile.py if there's work to do AND enough time has passed.
+
+    Replaces Cole's 6PM wall-clock gate (GH issues #4/#6) — Christopher doesn't
+    keep 9-5 hours, and time-of-day is a brittle trigger anyway. Policy:
+
+    1. Find work: any bare-date daily that's uncompiled OR whose hash changed
+    2. Check cadence: last compile run must be >= COMPILE_MIN_INTERVAL_HOURS ago
+    3. Check budget: today's cumulative compile cost must be < DAILY_COMPILE_COST_CAP_USD
+
+    All three must be true to fire. Cost cap protects against the runaway
+    documented in Cole's GH issue #3 ($115 in 20 minutes).
+    """
     import subprocess as _sp
+    from hashlib import sha256
 
     now = datetime.now(timezone.utc).astimezone()
-    if now.hour < COMPILE_AFTER_HOUR:
-        return
 
-    today_log = f"{now.strftime('%Y-%m-%d')}.md"
+    # Load compile state
+    compile_state: dict = {}
     if STATE_FILE.exists():
         try:
             compile_state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            ingested = compile_state.get("ingested", {})
-            if today_log in ingested:
-                from hashlib import sha256
-                log_path = DAILY_DIR / today_log
-                if log_path.exists():
-                    current_hash = sha256(log_path.read_bytes()).hexdigest()[:16]
-                    if ingested[today_log].get("hash") == current_hash:
-                        return
         except (json.JSONDecodeError, OSError):
             pass
+    ingested = compile_state.get("ingested", {})
+
+    # 1. Is there work to do?
+    work_exists = False
+    bare_date_re = __import__("re").compile(r"^\d{4}-\d{2}-\d{2}\.md$")
+    for p in DAILY_DIR.glob("*.md"):
+        if not bare_date_re.match(p.name):
+            continue
+        rec = ingested.get(p.name)
+        if not rec:
+            work_exists = True
+            break
+        current_hash = sha256(p.read_bytes()).hexdigest()[:16]
+        if rec.get("hash") != current_hash:
+            work_exists = True
+            break
+    if not work_exists:
+        return
+
+    # 2. Cadence guard — don't thrash. Check last compile timestamp across ingested.
+    last_compile_iso = None
+    for rec in ingested.values():
+        ts = rec.get("compiled_at")
+        if ts and (last_compile_iso is None or ts > last_compile_iso):
+            last_compile_iso = ts
+    if last_compile_iso:
+        try:
+            last_compile_dt = datetime.fromisoformat(last_compile_iso)
+            hours_since = (now - last_compile_dt).total_seconds() / 3600
+            if hours_since < COMPILE_MIN_INTERVAL_HOURS:
+                logging.info("SKIP compile: %.2fh since last (min %.2fh)",
+                             hours_since, COMPILE_MIN_INTERVAL_HOURS)
+                return
+        except (ValueError, TypeError):
+            pass
+
+    # 3. Cost cap — sum today's compile spend, refuse if over budget.
+    today_date = now.strftime("%Y-%m-%d")
+    today_cost = 0.0
+    for rec in ingested.values():
+        ts = rec.get("compiled_at", "")
+        if ts.startswith(today_date):
+            today_cost += float(rec.get("cost_usd", 0.0))
+    if today_cost >= DAILY_COMPILE_COST_CAP_USD:
+        logging.error("COST CAP HIT: $%.4f today >= $%.2f cap — refusing compile",
+                      today_cost, DAILY_COMPILE_COST_CAP_USD)
+        log_to_inbox_master(
+            f"⚠ memory-compiler compile SKIPPED: daily cost cap hit "
+            f"(${today_cost:.2f} >= ${DAILY_COMPILE_COST_CAP_USD:.2f}). "
+            f"Raise DAILY_COMPILE_COST_CAP_USD in config.py or wait until tomorrow."
+        )
+        return
 
     compile_script = SCRIPTS_DIR / "compile.py"
     if not compile_script.exists():
         return
 
-    logging.info("End-of-day compilation triggered (after %d:00)", COMPILE_AFTER_HOUR)
+    logging.info("Compile triggered (work present, cadence OK, $%.2f/%.2f spent today)",
+                 today_cost, DAILY_COMPILE_COST_CAP_USD)
     cmd = ["uv", "run", "--directory", str(REPO_ROOT), "python", str(compile_script)]
 
     kwargs: dict = {}

@@ -31,6 +31,7 @@ from config import (
     AGENTS_FILE,
     CANDIDATES_DIR,
     CONNECTIONS_DIR,
+    DAILY_COMPILE_COST_CAP_USD,
     DAILY_DIR,
     INDEX_FILE,
     KNOWLEDGE_DIR,
@@ -63,21 +64,40 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
     log_content = log_path.read_text(encoding="utf-8")
     wiki_index = read_wiki_index()
 
-    existing_context_parts = []
+    # DO NOT dump full article bodies into the prompt.
+    # This was the root cause of Cole's repo Issue #5/#3 — ellismw burned $115
+    # on one session because every compile call pasted every existing article.
+    # Instead: list filenames + titles only. The Agent SDK has Read/Glob/Grep
+    # allowed — it can open whichever articles are actually relevant to the
+    # daily log being compiled.
+    existing_article_listing_parts = []
     for article_path in list_wiki_articles():
         try:
-            rel = article_path.relative_to(KNOWLEDGE_DIR)
+            rel = str(article_path.relative_to(KNOWLEDGE_DIR))
         except ValueError:
             try:
-                rel = article_path.relative_to(CANDIDATES_DIR.parent.parent)
+                rel = str(article_path.relative_to(CANDIDATES_DIR.parent.parent))
             except ValueError:
                 rel = article_path.name
-        existing_context_parts.append(
-            f"### {rel}\n```markdown\n{article_path.read_text(encoding='utf-8')}\n```"
-        )
-    existing_articles_context = (
-        "\n\n".join(existing_context_parts)
-        if existing_context_parts
+        # Extract title from frontmatter if present, else use filename
+        title = article_path.stem
+        try:
+            head = article_path.read_text(encoding="utf-8")[:800]
+            if head.startswith("---"):
+                for line in head.splitlines()[1:]:
+                    if line.startswith("title:"):
+                        title = line.split(":", 1)[1].strip().strip('"').strip("'")
+                        break
+                    if line.strip() == "---":
+                        break
+        except Exception:
+            pass
+        size_kb = article_path.stat().st_size // 1024
+        existing_article_listing_parts.append(f"- `{rel}` ({size_kb}KB) — {title}")
+
+    existing_articles_listing = (
+        "\n".join(existing_article_listing_parts)
+        if existing_article_listing_parts
         else "(No existing compiler-owned articles yet — this may be the first compile run.)"
     )
 
@@ -124,9 +144,13 @@ in {CANDIDATES_DIR} / today's file instead — Christopher will review it.
 
 {log_content}
 
-## Existing compiler-owned articles (for context — don't duplicate)
+## Existing compiler-owned articles (filenames + titles only)
 
-{existing_articles_context}
+Use the `Read` tool to open any of these that look relevant to today's daily
+log. **Do not** attempt to dump them all into working memory — only read what
+you actually need. This keeps costs bounded as the knowledge base grows.
+
+{existing_articles_listing}
 
 ## Your task
 
@@ -300,8 +324,31 @@ def main():
     if args.dry_run:
         return
 
+    # Daily cost cap — check what's already been spent today before starting.
+    today_prefix = now_iso()[:10]
+    today_cost_so_far = sum(
+        float(rec.get("cost_usd", 0.0))
+        for rec in state.get("ingested", {}).values()
+        if rec.get("compiled_at", "").startswith(today_prefix)
+    )
+    budget_remaining = DAILY_COMPILE_COST_CAP_USD - today_cost_so_far
+    print(f"Daily cost cap: ${DAILY_COMPILE_COST_CAP_USD:.2f} | Spent today: ${today_cost_so_far:.2f} | Remaining: ${budget_remaining:.2f}")
+    if budget_remaining <= 0:
+        msg = f"⚠ memory-compiler: daily cost cap ${DAILY_COMPILE_COST_CAP_USD:.2f} already hit (spent ${today_cost_so_far:.2f}). Aborting."
+        print(msg)
+        log_to_inbox_master(msg)
+        return
+
     total_cost = 0.0
     for i, log_path in enumerate(to_compile, 1):
+        # Check cap before each compile — halt mid-batch if exceeded
+        if today_cost_so_far + total_cost >= DAILY_COMPILE_COST_CAP_USD:
+            msg = (f"⚠ memory-compiler: daily cost cap reached mid-batch "
+                   f"(${today_cost_so_far + total_cost:.2f} >= ${DAILY_COMPILE_COST_CAP_USD:.2f}). "
+                   f"Skipping remaining {len(to_compile) - i + 1} file(s).")
+            print(msg)
+            log_to_inbox_master(msg)
+            break
         print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
         cost = asyncio.run(compile_daily_log(log_path, state))
         total_cost += cost
