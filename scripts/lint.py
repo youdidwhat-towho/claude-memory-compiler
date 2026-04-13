@@ -15,7 +15,7 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from config import KNOWLEDGE_DIR, REPORTS_DIR, now_iso, today_iso
+from config import CANDIDATES_DIR, CONNECTIONS_DIR, KNOWLEDGE_DIR, REPORTS_DIR, REPO_ROOT, now_iso, today_iso
 from utils import (
     count_inbound_links,
     extract_wikilinks,
@@ -29,41 +29,61 @@ from utils import (
     wiki_article_exists,
 )
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = REPO_ROOT
+
+
+def _rel_for_report(article: Path) -> str:
+    """Produce a report-friendly relative path for a compiler-owned article."""
+    for base in (KNOWLEDGE_DIR, CANDIDATES_DIR):
+        try:
+            return str(article.relative_to(base))
+        except ValueError:
+            continue
+    return article.name
 
 
 def check_broken_links() -> list[dict]:
-    """Check for [[wikilinks]] that point to non-existent articles."""
+    """Check for [[wikilinks]] that point to non-existent articles (vault-aware)."""
     issues = []
     for article in list_wiki_articles():
         content = article.read_text(encoding="utf-8")
-        rel = article.relative_to(KNOWLEDGE_DIR)
+        rel = _rel_for_report(article)
         for link in extract_wikilinks(content):
-            if link.startswith("daily/"):
-                continue  # daily log references are valid
+            if link.startswith("daily/") or link.startswith("http"):
+                continue
             if not wiki_article_exists(link):
                 issues.append({
                     "severity": "error",
                     "check": "broken_link",
-                    "file": str(rel),
-                    "detail": f"Broken link: [[{link}]] - target does not exist",
+                    "file": rel,
+                    "detail": f"Broken link: [[{link}]] — target does not exist",
                 })
     return issues
 
 
 def check_orphan_pages() -> list[dict]:
-    """Check for articles with zero inbound links."""
+    """Check for CONNECTION articles with zero inbound links.
+
+    Skips candidates/ — those are review-queue files, orphan status is expected.
+    Skips connections whose filename matches the YYYY-MM-DD-* pattern (time-boxed).
+    """
     issues = []
     for article in list_wiki_articles():
-        rel = article.relative_to(KNOWLEDGE_DIR)
-        link_target = str(rel).replace(".md", "").replace("\\", "/")
+        try:
+            rel_to_knowledge = article.relative_to(KNOWLEDGE_DIR)
+        except ValueError:
+            continue  # skip candidates/
+        rel_str = str(rel_to_knowledge)
+        if not rel_str.startswith("connections/"):
+            continue
+        link_target = rel_str.replace(".md", "").replace("\\", "/")
         inbound = count_inbound_links(link_target)
         if inbound == 0:
             issues.append({
-                "severity": "warning",
-                "check": "orphan_page",
-                "file": str(rel),
-                "detail": f"Orphan page: no other articles link to [[{link_target}]]",
+                "severity": "suggestion",
+                "check": "orphan_connection",
+                "file": rel_str,
+                "detail": f"Connection article has no inbound links: [[{link_target}]]",
             })
     return issues
 
@@ -105,42 +125,33 @@ def check_stale_articles() -> list[dict]:
 
 
 def check_missing_backlinks() -> list[dict]:
-    """Check for asymmetric links: A links to B but B doesn't link to A."""
-    issues = []
-    for article in list_wiki_articles():
-        content = article.read_text(encoding="utf-8")
-        rel = article.relative_to(KNOWLEDGE_DIR)
-        source_link = str(rel).replace(".md", "").replace("\\", "/")
+    """Skip — backlink discipline doesn't apply at this scope.
 
-        for link in extract_wikilinks(content):
-            if link.startswith("daily/"):
-                continue
-            target_path = KNOWLEDGE_DIR / f"{link}.md"
-            if target_path.exists():
-                target_content = target_path.read_text(encoding="utf-8")
-                if f"[[{source_link}]]" not in target_content:
-                    issues.append({
-                        "severity": "suggestion",
-                        "check": "missing_backlink",
-                        "file": str(rel),
-                        "detail": f"[[{source_link}]] links to [[{link}]] but not vice versa",
-                        "auto_fixable": True,
-                    })
-    return issues
+    Christopher's vault is linked via Smart Connections (embeddings) + MEMORY.md
+    curation. Requiring bidirectional [[wikilinks]] on compiler-owned articles would
+    create noise without helping retrieval.
+    """
+    return []
 
 
 def check_sparse_articles() -> list[dict]:
-    """Check for articles with fewer than 200 words."""
+    """Check connection articles for under-200-word sparseness. Skip candidates."""
     issues = []
     for article in list_wiki_articles():
+        try:
+            rel_to_knowledge = article.relative_to(KNOWLEDGE_DIR)
+        except ValueError:
+            continue  # candidates/ are allowed to be terse
+        rel_str = str(rel_to_knowledge)
+        if not rel_str.startswith("connections/"):
+            continue
         word_count = get_article_word_count(article)
         if word_count < 200:
-            rel = article.relative_to(KNOWLEDGE_DIR)
             issues.append({
                 "severity": "suggestion",
                 "check": "sparse_article",
-                "file": str(rel),
-                "detail": f"Sparse article: {word_count} words (minimum recommended: 200)",
+                "file": rel_str,
+                "detail": f"Sparse connection article: {word_count} words (suggest 200+)",
             })
     return issues
 
@@ -250,23 +261,29 @@ def generate_report(all_issues: list[dict]) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Lint the knowledge base")
     parser.add_argument(
+        "--with-llm",
+        action="store_true",
+        help="Include LLM contradiction check (costs ~$0.15-0.25). Default: structural-only.",
+    )
+    parser.add_argument(
         "--structural-only",
         action="store_true",
-        help="Skip LLM-based checks (contradictions) - faster and free",
+        help="[DEFAULT] Skip LLM-based checks. Free + instant.",
     )
     args = parser.parse_args()
+    # Structural-only is the default; --with-llm opts in
+    args.structural_only = not args.with_llm
 
     print("Running knowledge base lint checks...")
     all_issues: list[dict] = []
 
     # Structural checks (free, instant)
     checks = [
-        ("Broken links", check_broken_links),
-        ("Orphan pages", check_orphan_pages),
-        ("Orphan sources", check_orphan_sources),
-        ("Stale articles", check_stale_articles),
-        ("Missing backlinks", check_missing_backlinks),
-        ("Sparse articles", check_sparse_articles),
+        ("Broken wikilinks (vault-wide resolution)", check_broken_links),
+        ("Orphan connection articles", check_orphan_pages),
+        ("Uncompiled daily logs", check_orphan_sources),
+        ("Stale (source changed since compile)", check_stale_articles),
+        ("Sparse connection articles", check_sparse_articles),
     ]
 
     for name, check_fn in checks:

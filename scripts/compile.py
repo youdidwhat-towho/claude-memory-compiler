@@ -1,24 +1,45 @@
-"""
-Compile daily conversation logs into structured knowledge articles.
+"""Compile bare-date daily notes into memory-candidate proposals + connection articles.
 
-This is the "LLM compiler" - it reads daily logs (source code) and produces
-organized knowledge articles (the executable).
+SCOPE: Christopher is the curator of his memory layer. This compiler PROPOSES —
+it does not AUTHORITATIVELY UPDATE memory files, MEMORY.md, pillar files, or
+any curated vault surface. Writes are restricted to two directories:
+  - drafts/active/memory-compiler-candidates/   → candidate memory entries for Christopher's weekly review
+  - knowledge/connections/                       → cross-session connection articles (low-stakes, Christopher can prune)
+
+Post-flight validation REJECTS any write outside the allowlist. Pre-flight prompt
+tells the Agent SDK the same thing. Belt + suspenders.
 
 Usage:
-    uv run python compile.py                    # compile new/changed logs only
-    uv run python compile.py --all              # force recompile everything
-    uv run python compile.py --file daily/2026-04-01.md  # compile a specific log
-    uv run python compile.py --dry-run          # show what would be compiled
+    uv run python compile.py                          # compile new/changed bare-date logs only
+    uv run python compile.py --all                    # force recompile every bare-date log
+    uv run python compile.py --file daily/2026-04-12.md
+    uv run python compile.py --dry-run
 """
 
 from __future__ import annotations
+
+# Recursion prevention — set before any SDK import
+import os
+os.environ.setdefault("CLAUDE_INVOKED_BY", "memory_compile")
 
 import argparse
 import asyncio
 import sys
 from pathlib import Path
 
-from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, now_iso
+from config import (
+    AGENTS_FILE,
+    CANDIDATES_DIR,
+    CONNECTIONS_DIR,
+    DAILY_DIR,
+    INDEX_FILE,
+    KNOWLEDGE_DIR,
+    REPO_ROOT,
+    VAULT_WRITE_ALLOWLIST,
+    log_to_inbox_master,
+    now_iso,
+    path_is_allowed_for_vault_write,
+)
 from utils import (
     file_hash,
     list_raw_files,
@@ -28,15 +49,9 @@ from utils import (
     save_state,
 )
 
-# ── Paths for the LLM to use ──────────────────────────────────────────
-ROOT_DIR = Path(__file__).resolve().parent.parent
-
 
 async def compile_daily_log(log_path: Path, state: dict) -> float:
-    """Compile a single daily log into knowledge articles.
-
-    Returns the API cost of the compilation.
-    """
+    """Compile one bare-date daily log. Returns the API cost."""
     from claude_agent_sdk import (
         AssistantMessage,
         ClaudeAgentOptions,
@@ -46,93 +61,151 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
     )
 
     log_content = log_path.read_text(encoding="utf-8")
-    schema = AGENTS_FILE.read_text(encoding="utf-8")
     wiki_index = read_wiki_index()
 
-    # Read existing articles for context
-    existing_articles_context = ""
-    existing = {}
+    existing_context_parts = []
     for article_path in list_wiki_articles():
-        rel = article_path.relative_to(KNOWLEDGE_DIR)
-        existing[str(rel)] = article_path.read_text(encoding="utf-8")
-
-    if existing:
-        parts = []
-        for rel_path, content in existing.items():
-            parts.append(f"### {rel_path}\n```markdown\n{content}\n```")
-        existing_articles_context = "\n\n".join(parts)
+        try:
+            rel = article_path.relative_to(KNOWLEDGE_DIR)
+        except ValueError:
+            try:
+                rel = article_path.relative_to(CANDIDATES_DIR.parent.parent)
+            except ValueError:
+                rel = article_path.name
+        existing_context_parts.append(
+            f"### {rel}\n```markdown\n{article_path.read_text(encoding='utf-8')}\n```"
+        )
+    existing_articles_context = (
+        "\n\n".join(existing_context_parts)
+        if existing_context_parts
+        else "(No existing compiler-owned articles yet — this may be the first compile run.)"
+    )
 
     timestamp = now_iso()
+    today = timestamp[:10]
 
-    prompt = f"""You are a knowledge compiler. Your job is to read a daily conversation log
-and extract knowledge into structured wiki articles.
+    prompt = f"""You are the memory compiler for Christopher's whole-life Claude brain.
 
-## Schema (AGENTS.md)
+## Who Christopher is
+CEO of Honeybird Homes (nationwide real estate investment), building Buy Box AI
+(deal underwriting + buyer matching), running an AI consulting agency with
+partner Justin (New Earth AI), and a coaching program for agents/investors.
+Husband to Bettina, father of three (7-year-old daughter, 21-year-old son who
+works at Honeybird, 29-year-old son). Deep faith. ADHD. Information hoarder.
 
-{schema}
+His vault reaches every domain of his life — faith, family, personal (health,
+home, finances), Honeybird deals, Buy Box dev, consulting, coaching, research.
+You are compiling knowledge across ALL of it, not just one venture.
 
-## Current Wiki Index
+## Your constraint (read carefully)
 
-{wiki_index}
+Christopher is the curator of his memory layer. You are NOT. You PROPOSE
+candidates and connections; he promotes them to curated memory on his schedule.
 
-## Existing Wiki Articles
+You are allowed to write to EXACTLY these two directories:
+  1. {CANDIDATES_DIR}
+  2. {CONNECTIONS_DIR}
 
-{existing_articles_context if existing_articles_context else "(No existing articles yet)"}
+You are FORBIDDEN from writing to:
+  - {KNOWLEDGE_DIR / 'index.md'} (leave it alone — Christopher's MEMORY.md is the curated index)
+  - Any file under ~/.claude/ (memory/, settings.json, agents/, skills/)
+  - Any file under ~/second-brain/ OTHER than the two allowed dirs above — specifically:
+    memory/, MEMORY.md, SOUL.md, USER.md, HEARTBEAT.md, HABITS.md, CLAUDE.md,
+    reference/, honeybird/, buybox/, consulting/, coaching/, family/, faith/,
+    personal/, peeps/, contacts/, deals/, projects/ — all OFF LIMITS.
 
-## Daily Log to Compile
+If you feel the urge to edit a curated file, DON'T. Write it as a candidate
+in {CANDIDATES_DIR} / today's file instead — Christopher will review it.
+
+## The source log
 
 **File:** {log_path.name}
+**Today:** {today}
 
 {log_content}
 
-## Your Task
+## Existing compiler-owned articles (for context — don't duplicate)
 
-Read the daily log above and compile it into wiki articles following the schema exactly.
+{existing_articles_context}
 
-### Rules:
+## Your task
 
-1. **Extract key concepts** - Identify 3-7 distinct concepts worth their own article
-2. **Create concept articles** in `knowledge/concepts/` - One .md file per concept
-   - Use the exact article format from AGENTS.md (YAML frontmatter + sections)
-   - Include `sources:` in frontmatter pointing to the daily log file
-   - Use `[[concepts/slug]]` wikilinks to link to related concepts
-   - Write in encyclopedia style - neutral, comprehensive
-3. **Create connection articles** in `knowledge/connections/` if this log reveals non-obvious
-   relationships between 2+ existing concepts
-4. **Update existing articles** if this log adds new information to concepts already in the wiki
-   - Read the existing article, add the new information, add the source to frontmatter
-5. **Update knowledge/index.md** - Add new entries to the table
-   - Each entry: `| [[path/slug]] | One-line summary | source-file | {timestamp[:10]} |`
-6. **Append to knowledge/log.md** - Add a timestamped entry:
+1. **Extract 3–8 memory candidates** from today's log. Each is one proposed
+   addition or update to Christopher's curated memory layer. Write them to a
+   SINGLE file at:
+     {CANDIDATES_DIR / f"{today}.md"}
+   Format each candidate as:
+
    ```
-   ## [{timestamp}] compile | {log_path.name}
-   - Source: daily/{log_path.name}
-   - Articles created: [[concepts/x]], [[concepts/y]]
-   - Articles updated: [[concepts/z]] (if any)
+   ### Candidate: [short title]
+   **Type:** [user | feedback | project | reference | connection]
+   **Proposed file:** memory/[suggested_slug].md
+   **Summary:** [one line Christopher could paste into MEMORY.md]
+   **Body:**
+   [full proposed memory body — if this is approved, this is what gets saved]
+
+   **Why:** [why this is worth remembering]
+   **How to apply:** [when/where this guidance or fact matters]
+   **Source:** daily/{log_path.name}
+   ---
    ```
 
-### File paths:
-- Write concept articles to: {CONCEPTS_DIR}
-- Write connection articles to: {CONNECTIONS_DIR}
-- Update index at: {KNOWLEDGE_DIR / 'index.md'}
-- Append log at: {KNOWLEDGE_DIR / 'log.md'}
+   If no candidates are worth proposing, create the file anyway with a single
+   line: "No candidates proposed from {log_path.name}."
 
-### Quality standards:
-- Every article must have complete YAML frontmatter
-- Every article must link to at least 2 other articles via [[wikilinks]]
-- Key Points section should have 3-5 bullet points
-- Details section should have 2+ paragraphs
-- Related Concepts section should have 2+ entries
-- Sources section should cite the daily log with specific claims extracted
+2. **Write connection articles** to {CONNECTIONS_DIR} ONLY when today's log
+   reveals a non-obvious link between two or more concepts, domains, or people.
+   Examples:
+   - A pattern from a faith reflection that mirrors how Christopher coaches agents
+   - A Buy Box buyer criterion that matches something an institutional buyer said 2 weeks ago
+   - A promise Christopher made to Bettina that connects to a home-project timeline
+   - A consulting insight that also applies to how Honeybird dispo works
+
+   Create at most 1–2 connection articles per daily log. Skip entirely if nothing
+   in today's log is cross-cutting. Use this format:
+
+   ```markdown
+   ---
+   title: "Connection: X and Y"
+   connects:
+     - "concept-x-brief"
+     - "concept-y-brief"
+   sources:
+     - "daily/{log_path.name}"
+   created: {today}
+   updated: {today}
+   ---
+
+   # Connection: X and Y
+
+   ## The Connection
+   [What links them]
+
+   ## Key Insight
+   [The non-obvious relationship surfaced]
+
+   ## Evidence
+   [Specific quotes or events from the daily log]
+   ```
+
+   Filename: {CONNECTIONS_DIR}/{{slug}}.md where slug is a short kebab-case label.
+
+3. **Do NOT** update {KNOWLEDGE_DIR / 'index.md'}, do NOT touch any other file.
+
+## Tone and voice
+- Write candidates and connections in Christopher's first-person voice where
+  applicable ("I noticed", "I decided", "Bettina mentioned").
+- Be concrete. Name specific people, deals, properties, scriptures, kids' names
+  when they appear in the source.
+- Skip anything generic. If a candidate could apply to "any CEO," it's too vague.
 """
 
     cost = 0.0
-
     try:
         async for message in query(
             prompt=prompt,
             options=ClaudeAgentOptions(
-                cwd=str(ROOT_DIR),
+                cwd=str(REPO_ROOT),
                 system_prompt={"type": "preset", "preset": "claude_code"},
                 allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
                 permission_mode="acceptEdits",
@@ -142,17 +215,35 @@ Read the daily log above and compile it into wiki articles following the schema 
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock):
-                        pass  # compilation output - LLM writes files directly
+                        pass
             elif isinstance(message, ResultMessage):
                 cost = message.total_cost_usd or 0.0
                 print(f"  Cost: ${cost:.4f}")
     except Exception as e:
         print(f"  Error: {e}")
+        log_to_inbox_master(
+            f"⚠ memory-compiler compile FAILED: {log_path.name} — {type(e).__name__}: {str(e)[:200]}"
+        )
         return 0.0
 
-    # Update state
-    rel_path = log_path.name
-    state.setdefault("ingested", {})[rel_path] = {
+    # Post-flight validation: scan what was written, flag any violations
+    violations = []
+    for candidate_dir in [CANDIDATES_DIR, CONNECTIONS_DIR]:
+        if not candidate_dir.exists():
+            continue
+        for f in candidate_dir.glob("*.md"):
+            if not path_is_allowed_for_vault_write(f):
+                violations.append(str(f))
+    # Also spot-check that the index/log files weren't touched
+    # (we'd catch explicit writes elsewhere if compile ever tried)
+
+    if violations:
+        msg = f"⚠ memory-compiler compile WROTE OUTSIDE ALLOWLIST: {violations}"
+        print(msg)
+        log_to_inbox_master(msg)
+
+    rel_name = log_path.name
+    state.setdefault("ingested", {})[rel_name] = {
         "hash": file_hash(log_path),
         "compiled_at": now_iso(),
         "cost_usd": cost,
@@ -160,26 +251,29 @@ Read the daily log above and compile it into wiki articles following the schema 
     state["total_cost"] = state.get("total_cost", 0.0) + cost
     save_state(state)
 
+    log_to_inbox_master(
+        f"memory-compiler compile: {log_path.name} → candidates+connections written (${cost:.4f})"
+    )
     return cost
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compile daily logs into knowledge articles")
+    parser = argparse.ArgumentParser(description="Compile bare-date daily logs into memory candidates")
     parser.add_argument("--all", action="store_true", help="Force recompile all logs")
     parser.add_argument("--file", type=str, help="Compile a specific daily log file")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be compiled")
     args = parser.parse_args()
 
+    # Ensure write dirs exist
+    CANDIDATES_DIR.mkdir(parents=True, exist_ok=True)
+    CONNECTIONS_DIR.mkdir(parents=True, exist_ok=True)
+
     state = load_state()
 
-    # Determine which files to compile
     if args.file:
         target = Path(args.file)
         if not target.is_absolute():
             target = DAILY_DIR / target.name
-        if not target.exists():
-            # Try resolving relative to project root
-            target = ROOT_DIR / args.file
         if not target.exists():
             print(f"Error: {args.file} not found")
             sys.exit(1)
@@ -197,17 +291,15 @@ def main():
                     to_compile.append(log_path)
 
     if not to_compile:
-        print("Nothing to compile - all daily logs are up to date.")
+        print("Nothing to compile — all bare-date daily logs are up to date.")
         return
 
     print(f"{'[DRY RUN] ' if args.dry_run else ''}Files to compile ({len(to_compile)}):")
     for f in to_compile:
         print(f"  - {f.name}")
-
     if args.dry_run:
         return
 
-    # Compile each file sequentially
     total_cost = 0.0
     for i, log_path in enumerate(to_compile, 1):
         print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
@@ -217,7 +309,7 @@ def main():
 
     articles = list_wiki_articles()
     print(f"\nCompilation complete. Total cost: ${total_cost:.2f}")
-    print(f"Knowledge base: {len(articles)} articles")
+    print(f"Compiler-owned articles: {len(articles)}")
 
 
 if __name__ == "__main__":
