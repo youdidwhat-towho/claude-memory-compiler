@@ -84,10 +84,12 @@ def append_to_daily_log(content: str, section: str, source: str) -> None:
             encoding="utf-8",
         )
 
+    # Provenance tag in a blockquote so it doesn't fight the content's own
+    # `## Session Title: ...` H2. Content carries its own structure now.
     time_str = today.strftime("%H:%M")
-    header = f"\n## {section} — {time_str} MST (source: {source})\n\n"
+    provenance = f"\n---\n\n> _auto-captured at {time_str} MST via {source}_\n\n"
     with open(log_path, "a", encoding="utf-8") as f:
-        f.write(header)
+        f.write(provenance)
         f.write(content)
         f.write("\n")
 
@@ -102,30 +104,37 @@ async def run_flush(context: str) -> str:
         query,
     )
 
-    prompt = f"""You are extracting what's worth preserving from a Claude Code session
-Christopher just finished. Christopher is the CEO of Honeybird Homes (real
-estate investment), is building Buy Box AI, runs an AI consulting agency and a
-coaching program, has a wife Bettina and three kids (a 7-year-old daughter, a
-21-year-old son, a 29-year-old son), is a man of deep faith, has ADHD, and
-uses Claude Code for EVERY domain of his life — not just work.
+    prompt = f"""You are writing the session TLDR + extracting what's worth preserving
+from a Claude Code session Christopher just finished.
 
-A session might be about a deal, a Buy Box feature, a family moment, a faith
-reflection, home stuff, personal admin, a brain dump of ideas, a health check,
-a promise made to someone, a new person met, a shift in how a buyer thinks
-about a property — anything. Do NOT assume a session is about real estate or
-software engineering unless it actually is.
+Christopher is the CEO of Honeybird Homes (real estate investment), is
+building Buy Box AI, runs an AI consulting agency and a coaching program,
+has a wife Bettina and three kids (a 7-year-old daughter, a 21-year-old
+son, a 29-year-old son), is a man of deep faith, has ADHD, and uses
+Claude Code for EVERY domain of his life — not just work.
 
-Return a concise structured extract of what's worth preserving. Write in
-Christopher's voice ("Worked on X. Decided Y because Z. Bettina said W.").
-First-person, tight, factual. No tools — plain text only.
+A session might be about a deal, a Buy Box feature, a family moment, a
+faith reflection, home stuff, personal admin, a brain dump of ideas, a
+health check, a promise made to someone, a new person met, a shift in
+how a buyer thinks about a property — anything. Do NOT assume a session
+is about real estate or software engineering unless it actually is.
 
-Use ONLY the sections below that actually have content. Skip any section with
-nothing to report. If nothing in the session is worth saving, respond with
-exactly: FLUSH_OK
+Write the output below in Christopher's voice ("Worked on X. Decided Y
+because Z. Bettina said W."). First-person, tight, factual. Plain text,
+no tools.
+
+**Skip any section with nothing to report.** If the entire session is
+trivial (routine lookups, mechanical file ops, ceremonial chatter) and
+nothing below would have real content, respond with exactly: FLUSH_OK
 
 ---
 
-**Context:** [one line — what was this session about, plainly, no jargon]
+## Session Title: [a 5–9 word title that names the session like a mini-TLDR headline, starting with a strong verb]
+
+**TLDR:** [2–4 sentences in my voice — what this session was, what got accomplished, why it mattered. The narrative framing. Don't just list steps; tell the story.]
+
+**What Got Shipped:**
+- [Concrete artifacts created/updated/pushed — files, commits, specs, skills, drafts, deliverables. Include commit hashes, file paths, or names if they appear in the session. If nothing shipped, skip this section.]
 
 **What I Decided:**
 - [decisions made + why, in my voice]
@@ -137,29 +146,37 @@ exactly: FLUSH_OK
 - [anything I said I'd do for anyone — Bettina, kids, team, buyer, partner, myself]
 
 **People Updates:**
-- [new people mentioned; new info on existing peeps; relationship shifts; "Matt said X", "J'Lien is at stage Y"]
+- [new people mentioned; new info on existing peeps; relationship shifts]
 
 **Deal / Business Shifts:**
-- [specific deal status changes; buyer Buy Box criteria changes; new institutional buyer intel; consulting pilot status; coaching curriculum decisions]
+- [specific deal status changes; buyer Buy Box criteria changes; institutional buyer intel; consulting pilot status; coaching curriculum decisions]
 
 **Ideas / Brain Dumps:**
-- [ideas I threw out — even half-formed; things to revisit; the "20 ideas so I don't lose 19" category]
+- [ideas I threw out — even half-formed; the "20 ideas so I don't lose 19" category]
 
 **Faith / Family / Personal:**
-- [reflections, scripture, prayers, kid moments, home projects, health, finances, anything personal]
+- [reflections, scripture, prayers, kid moments, home projects, health, finances]
+
+**Connections Noticed:**
+- [cross-domain links I surfaced — "the X in Buy Box maps to the Y Pace Morby said" / "the pattern from a faith reflection mirrors how I coach agents"]
 
 **Action Items:**
 - [ ] [follow-ups and TODOs, with who/what/when if known]
 
-**Connections Noticed:**
-- [cross-domain links I surfaced during the session — "the X in Buy Box maps to the Y Pace Morby said" / "the pattern from a faith reflection mirrors how I coach agents"]
+**Where to Start Next:**
+- [concrete forward-looking bullets for the next session — which file to open, which decision is pending, which person to contact, which unfinished thread to pick up. This is the handoff.]
+
+**Files / Commits / Cross-Links Touched:**
+- [explicit paths, commit hashes, repo URLs, peep files, skill names that came up. Helps `/pickup` rehydrate context later. Skip if none.]
 
 ---
 
-Skip anything that is:
-- Routine tool calls, file reads, or mechanical operations
-- Trivial clarification or ceremonial back-and-forth
-- Generic boilerplate that isn't Christopher-specific
+Rules:
+- Skip sections that would be empty — don't pad.
+- For trivial sessions, a short TLDR + Action Items is fine; everything else can be empty.
+- For big sessions (shipping, multi-thread, major decisions), fill everything relevant.
+- The Session Title + TLDR + Where to Start Next are what make this feel like a TLDR and not just a bullet dump. Do not skip those if there IS meaningful content.
+- Skip: routine tool calls, file reads, mechanical ops, ceremonial chatter, generic boilerplate not specific to Christopher.
 
 ## Conversation Context
 
