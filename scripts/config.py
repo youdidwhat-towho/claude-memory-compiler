@@ -53,12 +53,14 @@ TIMEZONE = "America/Phoenix"
 #   1. There's something to compile (uncompiled bare-date daily OR today's hash changed)
 #   2. It's been >= COMPILE_MIN_INTERVAL_HOURS since the last compile run
 # Time-of-day plays no role. Works regardless of when Christopher wraps up.
+#
+# NOTE: Christopher is on Claude Max. There is NO dollar-denominated cost to cap
+# — the Agent SDK runs under the flat subscription per Anthropic's clarification.
+# The `cost_usd` numbers recorded in state.json are phantom display values, not
+# actual charges. If runaway usage ever becomes a real concern it would surface
+# as Max session rate limits, which are self-limiting (SDK errors out) — not a
+# silent financial drain. No cost cap is enforced.
 COMPILE_MIN_INTERVAL_HOURS = 1.0
-
-# Cost cap — hard stop if today's compile spend exceeds this. Protects against
-# runaway cost (Cole's GH issue #3: ellismw burned $115 in 20 min).
-# Loud-fails to inbox/_inbox-master.md with ⚠ prefix when hit.
-DAILY_COMPILE_COST_CAP_USD = 3.00
 
 MAX_CONTEXT_CHARS = 15_000
 MIN_TURNS_TO_FLUSH = 1

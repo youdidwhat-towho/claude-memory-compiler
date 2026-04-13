@@ -30,7 +30,6 @@ from pathlib import Path
 
 from config import (
     COMPILE_MIN_INTERVAL_HOURS,
-    DAILY_COMPILE_COST_CAP_USD,
     DAILY_DIR,
     FLUSH_DEDUP_SECONDS,
     FLUSH_LOG,
@@ -195,14 +194,14 @@ def maybe_trigger_compilation() -> None:
     """Trigger compile.py if there's work to do AND enough time has passed.
 
     Replaces Cole's 6PM wall-clock gate (GH issues #4/#6) — Christopher doesn't
-    keep 9-5 hours, and time-of-day is a brittle trigger anyway. Policy:
+    keep 9-5 hours, and time-of-day is a brittle trigger anyway. Two gates:
 
     1. Find work: any bare-date daily that's uncompiled OR whose hash changed
     2. Check cadence: last compile run must be >= COMPILE_MIN_INTERVAL_HOURS ago
-    3. Check budget: today's cumulative compile cost must be < DAILY_COMPILE_COST_CAP_USD
 
-    All three must be true to fire. Cost cap protects against the runaway
-    documented in Cole's GH issue #3 ($115 in 20 minutes).
+    No dollar cost gate — Christopher is on Max, no dollar-denominated usage to
+    cap. The cadence gate is the only throttle and it's there to prevent
+    thrashing (e.g., rapid sequential session ends), not to ration spending.
     """
     import subprocess as _sp
     from hashlib import sha256
@@ -235,7 +234,7 @@ def maybe_trigger_compilation() -> None:
     if not work_exists:
         return
 
-    # 2. Cadence guard — don't thrash. Check last compile timestamp across ingested.
+    # 2. Cadence guard — don't thrash compile on rapid sequential session ends.
     last_compile_iso = None
     for rec in ingested.values():
         ts = rec.get("compiled_at")
@@ -252,29 +251,11 @@ def maybe_trigger_compilation() -> None:
         except (ValueError, TypeError):
             pass
 
-    # 3. Cost cap — sum today's compile spend, refuse if over budget.
-    today_date = now.strftime("%Y-%m-%d")
-    today_cost = 0.0
-    for rec in ingested.values():
-        ts = rec.get("compiled_at", "")
-        if ts.startswith(today_date):
-            today_cost += float(rec.get("cost_usd", 0.0))
-    if today_cost >= DAILY_COMPILE_COST_CAP_USD:
-        logging.error("COST CAP HIT: $%.4f today >= $%.2f cap — refusing compile",
-                      today_cost, DAILY_COMPILE_COST_CAP_USD)
-        log_to_inbox_master(
-            f"⚠ memory-compiler compile SKIPPED: daily cost cap hit "
-            f"(${today_cost:.2f} >= ${DAILY_COMPILE_COST_CAP_USD:.2f}). "
-            f"Raise DAILY_COMPILE_COST_CAP_USD in config.py or wait until tomorrow."
-        )
-        return
-
     compile_script = SCRIPTS_DIR / "compile.py"
     if not compile_script.exists():
         return
 
-    logging.info("Compile triggered (work present, cadence OK, $%.2f/%.2f spent today)",
-                 today_cost, DAILY_COMPILE_COST_CAP_USD)
+    logging.info("Compile triggered (work present, cadence OK)")
     cmd = ["uv", "run", "--directory", str(REPO_ROOT), "python", str(compile_script)]
 
     kwargs: dict = {}

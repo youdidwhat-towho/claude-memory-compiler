@@ -31,7 +31,6 @@ from config import (
     AGENTS_FILE,
     CANDIDATES_DIR,
     CONNECTIONS_DIR,
-    DAILY_COMPILE_COST_CAP_USD,
     DAILY_DIR,
     INDEX_FILE,
     KNOWLEDGE_DIR,
@@ -324,31 +323,8 @@ def main():
     if args.dry_run:
         return
 
-    # Daily cost cap — check what's already been spent today before starting.
-    today_prefix = now_iso()[:10]
-    today_cost_so_far = sum(
-        float(rec.get("cost_usd", 0.0))
-        for rec in state.get("ingested", {}).values()
-        if rec.get("compiled_at", "").startswith(today_prefix)
-    )
-    budget_remaining = DAILY_COMPILE_COST_CAP_USD - today_cost_so_far
-    print(f"Daily cost cap: ${DAILY_COMPILE_COST_CAP_USD:.2f} | Spent today: ${today_cost_so_far:.2f} | Remaining: ${budget_remaining:.2f}")
-    if budget_remaining <= 0:
-        msg = f"⚠ memory-compiler: daily cost cap ${DAILY_COMPILE_COST_CAP_USD:.2f} already hit (spent ${today_cost_so_far:.2f}). Aborting."
-        print(msg)
-        log_to_inbox_master(msg)
-        return
-
     total_cost = 0.0
     for i, log_path in enumerate(to_compile, 1):
-        # Check cap before each compile — halt mid-batch if exceeded
-        if today_cost_so_far + total_cost >= DAILY_COMPILE_COST_CAP_USD:
-            msg = (f"⚠ memory-compiler: daily cost cap reached mid-batch "
-                   f"(${today_cost_so_far + total_cost:.2f} >= ${DAILY_COMPILE_COST_CAP_USD:.2f}). "
-                   f"Skipping remaining {len(to_compile) - i + 1} file(s).")
-            print(msg)
-            log_to_inbox_master(msg)
-            break
         print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
         cost = asyncio.run(compile_daily_log(log_path, state))
         total_cost += cost
