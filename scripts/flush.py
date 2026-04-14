@@ -23,10 +23,16 @@ os.environ["CLAUDE_INVOKED_BY"] = "memory_flush"
 import asyncio
 import json
 import logging
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+# uv may not be on PATH when this script is spawned as a detached background
+# process (same silent-failure class that hit session-end.py / pre-compact.py).
+# Fall back to the known install location if `uv` isn't found on PATH.
+UV_BIN = shutil.which("uv") or "/Users/christopherbole/.local/bin/uv"
 
 from config import (
     COMPILE_MIN_INTERVAL_HOURS,
@@ -273,7 +279,7 @@ def maybe_trigger_compilation() -> None:
         return
 
     logging.info("Compile triggered (work present, cadence OK)")
-    cmd = ["uv", "run", "--directory", str(REPO_ROOT), "python", str(compile_script)]
+    cmd = [UV_BIN, "run", "--directory", str(REPO_ROOT), "python", str(compile_script)]
 
     kwargs: dict = {}
     if sys.platform == "win32":
