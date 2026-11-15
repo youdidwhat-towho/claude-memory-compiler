@@ -35,8 +35,10 @@ from config import (
     INDEX_FILE,
     KNOWLEDGE_DIR,
     REPO_ROOT,
+    SDK_MODEL,
     VAULT_WRITE_ALLOWLIST,
     log_to_inbox_master,
+    notify_failure,
     now_iso,
     path_is_allowed_for_vault_write,
 )
@@ -50,8 +52,12 @@ from utils import (
 )
 
 
+class CompileFailed(Exception):
+    """One daily log failed to compile. state.json is NOT advanced for it."""
+
+
 async def compile_daily_log(log_path: Path, state: dict) -> float:
-    """Compile one bare-date daily log. Returns the API cost."""
+    """Compile one bare-date daily log. Returns the API cost; raises CompileFailed on failure."""
     from claude_agent_sdk import (
         AssistantMessage,
         ClaudeAgentOptions,
@@ -130,8 +136,9 @@ You are FORBIDDEN from writing to:
   - Any file under ~/.claude/ (memory/, settings.json, agents/, skills/)
   - Any file under ~/second-brain/ OTHER than the two allowed dirs above — specifically:
     memory/, MEMORY.md, SOUL.md, USER.md, HEARTBEAT.md, HABITS.md, CLAUDE.md,
-    reference/, honeybird/, buybox/, consulting/, coaching/, family/, faith/,
-    personal/, peeps/, contacts/, deals/, projects/ — all OFF LIMITS.
+    REPOSITORIES.md, repositories/, reference/, honeybird/, buybox/,
+    consulting/, coaching/, family/, faith/, personal/, peeps/, contacts/,
+    deals/, projects/ — all OFF LIMITS.
 
 If you feel the urge to edit a curated file, DON'T. Write it as a candidate
 in {CANDIDATES_DIR} / today's file instead — Christopher will review it.
@@ -213,7 +220,31 @@ you actually need. This keeps costs bounded as the knowledge base grows.
 
    Filename: {CONNECTIONS_DIR}/{{slug}}.md where slug is a short kebab-case label.
 
-3. **Do NOT** update {KNOWLEDGE_DIR / 'index.md'}, do NOT touch any other file.
+3. **Watch for repository / codebase activity.** If today's log mentions:
+   (a) Archon workflow dispatches (workflow name, target repo, branch, outcome)
+   (b) PRs merged, notable commits, repo-scoped lessons (gotchas, base-branch overrides, env vars)
+   (c) Custom workflow tweaks under any `.archon/` folder
+   (d) Path prefixes `~/AI-Workspace/<repo>/`, `~/code/<repo>/`, or GitHub URLs `github.com/<org>/<repo>`
+   (e) Explicit phrases like "ran archon on", "dispatched to", "PR #N in <repo>"
+
+   Read `~/second-brain/REPOSITORIES.md` to resolve the repo slug from the Active
+   Pages table. Then propose candidates (in the same `{CANDIDATES_DIR / f"{today}.md"}` file)
+   that would update `~/second-brain/repositories/<slug>.md`:
+
+   - **Dispatch entries** → type `repository-activity`, proposed file `repositories/<slug>.md`,
+     body is a single bullet `- (YYYY-MM-DD) <one-line dispatch summary>` to append under
+     `## Dispatch History`.
+   - **Activity entries** (commits, PRs, lessons) → same shape, append under `## Recent Activity`.
+   - **Workflow rules** (gotchas, base-branch overrides, env vars) → body describes the rule;
+     target section is `## Workflow Preferences`.
+   - **New-repo signal:** if a repo is referenced 3+ times across recent daily logs but has
+     no per-repo page, propose a `repository-activity` candidate to CREATE one. Required
+     frontmatter: title, type=entity, category=repository, github, visibility, default_branch,
+     local_path, archon_enabled.
+
+   Do NOT write to `repositories/` or `REPOSITORIES.md` directly — propose only.
+
+4. **Do NOT** update {KNOWLEDGE_DIR / 'index.md'}, do NOT touch any other file.
 
 ## Tone and voice
 - Write candidates and connections in Christopher's first-person voice where
@@ -224,14 +255,19 @@ you actually need. This keeps costs bounded as the knowledge base grows.
 """
 
     cost = 0.0
+    result_error = None
     try:
         async for message in query(
             prompt=prompt,
             options=ClaudeAgentOptions(
+                model=SDK_MODEL,
                 cwd=str(REPO_ROOT),
                 system_prompt={"type": "preset", "preset": "claude_code"},
                 allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
                 permission_mode="acceptEdits",
+                # 2026-10-04: the vault sits outside cwd (REPO_ROOT); without add_dirs a
+                # vault read is a permission prompt, which a headless SDK run answers with a denial.
+                add_dirs=[str(Path.home() / "second-brain")],
                 max_turns=30,
             ),
         ):
@@ -242,12 +278,15 @@ you actually need. This keeps costs bounded as the knowledge base grows.
             elif isinstance(message, ResultMessage):
                 cost = message.total_cost_usd or 0.0
                 print(f"  Cost: ${cost:.4f}")
+                if getattr(message, "is_error", False):
+                    result_error = f"result {getattr(message, 'subtype', 'error')}: {str(getattr(message, 'result', ''))[:200]}"
     except Exception as e:
-        print(f"  Error: {e}")
-        log_to_inbox_master(
-            f"⚠ memory-compiler compile FAILED: {log_path.name} — {type(e).__name__}: {str(e)[:200]}"
-        )
-        return 0.0
+        result_error = f"{type(e).__name__}: {e}"
+    if result_error:
+        # Failure is an alert, not a ledger entry (vault decay rules, 2026-09-06).
+        print(f"  Error: {result_error}")
+        notify_failure(f"compile FAILED: {log_path.name} — {result_error[:120]}")
+        raise CompileFailed(result_error)
 
     # Post-flight validation: scan what was written, flag any violations
     violations = []
@@ -324,11 +363,21 @@ def main():
         return
 
     total_cost = 0.0
+    failed: list[str] = []
     for i, log_path in enumerate(to_compile, 1):
         print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
-        cost = asyncio.run(compile_daily_log(log_path, state))
+        try:
+            cost = asyncio.run(compile_daily_log(log_path, state))
+        except CompileFailed:
+            failed.append(log_path.name)
+            print(f"  FAILED.")
+            continue
         total_cost += cost
         print(f"  Done.")
+
+    if failed:
+        print(f"\nCompilation FAILED for {len(failed)} of {len(to_compile)}: {', '.join(failed)}")
+        sys.exit(1)
 
     articles = list_wiki_articles()
     print(f"\nCompilation complete. Total cost: ${total_cost:.2f}")

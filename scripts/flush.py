@@ -35,15 +35,19 @@ from pathlib import Path
 UV_BIN = shutil.which("uv") or "/Users/christopherbole/.local/bin/uv"
 
 from config import (
+    COMPILE_FROM_SESSION_END,
     COMPILE_MIN_INTERVAL_HOURS,
     DAILY_DIR,
+    VAULT_ROOT,
     FLUSH_DEDUP_SECONDS,
     FLUSH_LOG,
     FLUSH_STATE_FILE,
     REPO_ROOT,
     SCRIPTS_DIR,
+    SDK_MODEL,
     STATE_FILE,
     log_to_inbox_master,
+    notify_failure,
 )
 
 logging.basicConfig(
@@ -67,6 +71,76 @@ def save_flush_state(state: dict) -> None:
     FLUSH_STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
 
 
+def commit_daily_note(log_path: Path) -> None:
+    """Commit today's daily note immediately after writing to it.
+
+    Why this exists, and why it is not optional:
+
+    `.gitattributes` already gives `daily/YYYY-MM-DD.md` git's `union` merge
+    driver, so two machines appending to the same day's note is a solved
+    problem. But union merge only runs on TRACKED files. If this hook writes
+    the note and nobody commits it, the other machine's copy arrives as
+    "untracked working tree files would be overwritten by merge" and git
+    refuses the pull outright, before any merge driver is consulted. Every
+    pull after that fails until a human intervenes. On 2026-08-12 that left
+    the Mac reading a full-day-stale vault with no error anywhere in a
+    session, which is the exact silent-staleness failure vault-pull.sh was
+    built to prevent.
+
+    Committing here is what lets the union driver do its job.
+
+    Deliberate choices:
+      - Only this one path is staged and committed. Other sessions have work
+        in the tree and none of it gets swept in.
+      - Pre-commit hooks are NOT bypassed. The SSN/routing-number guard exists
+        because it has caught real secrets; a blocked commit leaves the file
+        untracked and the pull fails loudly, which is the safe direction.
+      - No push. Committing is enough to unblock the merge, and pushing from a
+        background hook invites its own races.
+      - Never raises. A failure here must not take down the flush.
+    """
+    import subprocess as _sp
+
+    # VAULT_ROOT, not REPO_ROOT. REPO_ROOT is this script's own repo
+    # (~/AI-Workspace/memory-compiler); the daily note lives in the vault.
+    def git(*args: str, **kw) -> _sp.CompletedProcess:
+        return _sp.run(
+            ["git", *args], cwd=str(VAULT_ROOT),
+            capture_output=True, text=True, timeout=20, **kw
+        )
+
+    try:
+        rel = str(log_path.relative_to(VAULT_ROOT))
+
+        # Another writer holds the index. Leave it alone; the vault-pull.sh
+        # guard sweeps up anything left untracked on the next session start.
+        if (VAULT_ROOT / ".git" / "index.lock").exists():
+            logging.info("commit_daily_note: index.lock present, skipping %s", rel)
+            return
+
+        if git("add", "--", rel).returncode != 0:
+            return
+
+        # Nothing staged for this path means the content was already committed.
+        if git("diff", "--cached", "--quiet", "--", rel).returncode == 0:
+            return
+
+        host = os.uname().nodename.split(".")[0]
+        res = git("commit", "-q", "-m", f"capture: daily note {log_path.stem} ({host})", "--", rel)
+        if res.returncode != 0:
+            # Most likely a pre-commit guard rejection. Unstage ONLY this path
+            # so another session's staged work is untouched, and log why.
+            git("restore", "--staged", "--", rel)
+            logging.warning(
+                "commit_daily_note: commit rejected for %s, left untracked. %s",
+                rel, (res.stdout + res.stderr).strip()[:400],
+            )
+            return
+        logging.info("commit_daily_note: committed %s", rel)
+    except Exception as exc:  # never break the flush over a git failure
+        logging.warning("commit_daily_note: %s", exc)
+
+
 def append_to_daily_log(content: str, section: str, source: str) -> None:
     """Append content to today's daily note. Creates the file if missing.
 
@@ -84,7 +158,7 @@ def append_to_daily_log(content: str, section: str, source: str) -> None:
             f"tags: [daily, auto-capture]\n"
             f"date: {today.strftime('%Y-%m-%d')}\n"
             f"---\n\n"
-            f"# Daily — {today.strftime('%Y-%m-%d')}\n\n"
+            f"# Daily {today.strftime('%Y-%m-%d')}\n\n"
             f"Append-only capture endpoint. Hook-captured session flushes below; "
             f"manual captures and /tldr slug files live alongside this in daily/.\n\n",
             encoding="utf-8",
@@ -98,6 +172,8 @@ def append_to_daily_log(content: str, section: str, source: str) -> None:
         f.write(provenance)
         f.write(content)
         f.write("\n")
+
+    commit_daily_note(log_path)
 
 
 async def run_flush(context: str) -> str:
@@ -175,6 +251,9 @@ nothing below would have real content, respond with exactly: FLUSH_OK
 **Files / Commits / Cross-Links Touched:**
 - [explicit paths, commit hashes, repo URLs, peep files, skill names that came up. Helps `/pickup` rehydrate context later. Skip if none.]
 
+**Repository / Codebase Activity:**
+- [Archon workflow dispatches (workflow name, target repo, branch, outcome), PRs merged, notable commits, custom workflow tweaks, or repo-scoped lessons. Tag each entry with the repo slug from `~/second-brain/REPOSITORIES.md` (e.g. "claudeclaw: ...", "memory-compiler: ...", "Archon: ...") so reflection can route the entry to `~/second-brain/repositories/<slug>.md`. Skip if no codebase work happened.]
+
 ---
 
 Rules:
@@ -194,6 +273,7 @@ Rules:
         async for message in query(
             prompt=prompt,
             options=ClaudeAgentOptions(
+                model=SDK_MODEL,
                 cwd=str(REPO_ROOT),
                 allowed_tools=[],
                 max_turns=2,
@@ -204,7 +284,9 @@ Rules:
                     if isinstance(block, TextBlock):
                         response += block.text
             elif isinstance(message, ResultMessage):
-                pass
+                if getattr(message, "is_error", False):
+                    return (f"FLUSH_ERROR: result {getattr(message, 'subtype', 'error')}: "
+                            f"{str(getattr(message, 'result', ''))[:200]}")
     except Exception as e:
         import traceback
         logging.error("Agent SDK error: %s\n%s", e, traceback.format_exc())
@@ -226,6 +308,8 @@ def maybe_trigger_compilation() -> None:
     cap. The cadence gate is the only throttle and it's there to prevent
     thrashing (e.g., rapid sequential session ends), not to ration spending.
     """
+    if not COMPILE_FROM_SESSION_END:
+        return  # nightly launchd run owns compile now (config.py, 2026-10-18)
     import subprocess as _sp
     from hashlib import sha256
 
@@ -329,19 +413,24 @@ def main():
     logging.info("Flushing session %s: %d chars", session_id, len(context))
 
     response = asyncio.run(run_flush(context))
+    failed = False
 
-    if "FLUSH_OK" in response:
+    if response.startswith("FLUSH_ERROR"):
+        # Checked first: an error string must never be read as FLUSH_OK or saved content.
+        # Failure is an alert, not a ledger or daily-note entry (vault decay rules, 2026-09-06).
+        failed = True
+        logging.error("Result: %s", response)
+        notify_failure(f"flush FAILED: {source} session {session_id[:8]} — {response[:120]}")
+    elif "FLUSH_OK" in response:
         logging.info("Result: FLUSH_OK (nothing worth saving)")
         # Don't pollute daily note with empty flushes; just log to inbox-master.
         log_to_inbox_master(
             f"memory-compiler flush: {source} session {session_id[:8]} — FLUSH_OK (nothing extracted)"
         )
-    elif "FLUSH_ERROR" in response:
-        logging.error("Result: %s", response)
-        append_to_daily_log(response, section=f"Memory Compiler — {source} ERROR", source=source)
-        log_to_inbox_master(
-            f"⚠ memory-compiler flush FAILED: {source} session {session_id[:8]} — {response[:200]}"
-        )
+    elif not response.strip():
+        failed = True
+        logging.error("Result: empty response from Agent SDK")
+        notify_failure(f"flush FAILED: {source} session {session_id[:8]} — empty response")
     else:
         logging.info("Result: saved to daily log (%d chars)", len(response))
         append_to_daily_log(response, section=f"Memory Compiler — {source}", source=source)
@@ -352,6 +441,10 @@ def main():
     save_flush_state({"session_id": session_id, "timestamp": time.time()})
     context_file.unlink(missing_ok=True)
     maybe_trigger_compilation()
+    if failed:
+        logging.error("FAILED: flush for session %s did not save anything", session_id)
+        print(f"FAILED: flush for session {session_id} (see {FLUSH_LOG})", file=sys.stderr)
+        sys.exit(1)
     logging.info("Flush complete for session %s", session_id)
 
 

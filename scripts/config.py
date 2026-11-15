@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # ── Read-only source layer (vault) ────────────────────────────────────
 DAILY_DIR = VAULT_ROOT / "daily"
-INBOX_MASTER = VAULT_ROOT / "inbox" / "_inbox-master.md"
+INBOX_MASTER = VAULT_ROOT / "LEDGER.md"  # moved from inbox/_inbox-master.md 2026-04-22
 
 # ── Scoped write targets (vault, drafts + connections only) ───────────
 # Compile.py is ALLOWED to write here and NOWHERE ELSE in the vault.
@@ -62,6 +62,19 @@ TIMEZONE = "America/Phoenix"
 # silent financial drain. No cost cap is enforced.
 COMPILE_MIN_INTERVAL_HOURS = 1.0
 
+# 2026-10-18 timer census pick (Boss approved, lane timer-picks-c3b7): compile no longer
+# starts after every session end (it ran up to 17 times a day, $18 to $41 a day of usage).
+# It runs once a night from launchd: ~/Library/LaunchAgents/com.christopherbole.memory-compile-nightly.plist
+# (02:40 MST). To go back to per-session compiles, set this to True and unload that plist.
+COMPILE_FROM_SESSION_END = False
+
+# 2026-11-15: pin the model the SDK child uses. Without this it inherits the global
+# ~/.claude/settings.json model, and a name the SDK does not accept ("fable") made every
+# compile and flush fail from 2026-11-11 on. Change it here, never in global settings.
+# [1m] is required: the compile prompt alone is ~177K tokens (1,391-article listing), so the
+# default 200K window fails with "Prompt is too long". Pre-11-11 runs used opus-4-6 at 1M (peak 217K).
+SDK_MODEL = "claude-sonnet-5-5[1m]"
+
 MAX_CONTEXT_CHARS = 15_000
 MIN_TURNS_TO_FLUSH = 1
 FLUSH_DEDUP_SECONDS = 60
@@ -82,6 +95,27 @@ def log_to_inbox_master(line: str) -> None:
     ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M MST")
     with open(INBOX_MASTER, "a", encoding="utf-8") as f:
         f.write(f"\n- {ts} — {line}\n")
+
+
+def notify_failure(line: str) -> None:
+    """A failure is an alert, not a ledger entry.
+
+    Vault rule (CLAUDE.md, Decay Rules, 2026-09-06): a hook or job that fails writes to
+    its own log and alerts the human; it does not append FAILED lines to LEDGER.md or
+    the daily note. Before this, every failed flush wrote the same error into both files
+    (two of them on 2026-09-05 alone), which is exactly the pollution the rule forbids.
+    Local macOS notification, fail-silent; flush.log already carries the full error.
+    """
+    try:
+        import subprocess
+        safe = line.replace('"', "'")[:200]
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{safe}" with title "memory-compiler" subtitle "failed — see flush.log"'],
+            timeout=5, check=False, capture_output=True,
+        )
+    except Exception:
+        pass
 
 
 def path_is_allowed_for_vault_write(path: Path) -> bool:
